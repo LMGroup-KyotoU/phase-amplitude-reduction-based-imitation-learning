@@ -1,0 +1,9 @@
+joblib
+matplotlib
+notebook
+numpy
+pandas
+scipy
+seaborn
+torch
+tqdm
