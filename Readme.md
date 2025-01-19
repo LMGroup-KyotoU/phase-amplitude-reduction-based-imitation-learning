@@ -17,6 +17,7 @@ If you get this model file, you can evaluate notebooks without full training.
 Please execute the following commands to extract　file.
 ```
 mkdir data && cd data
+# put on the downloaded zip file
 unzip data.zip
 ```
 
