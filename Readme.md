@@ -14,6 +14,11 @@ The frozen package list is in the file `requirements.lock` in our test environme
 
 We also prepared trained model files following [download link](https://drive.google.com/file/d/1ZEK94ZaQxnI86ZCczyJrsr_0kOy7e_wm/view?usp=drive_link).
 If you get this model file, you can evaluate notebooks without full training.
+Please execute the following commands to extract　file.
+```
+mkdir data && cd data
+unzip data.zip
+```
 
 # Notebook example 
 ### simple limit cycle task
