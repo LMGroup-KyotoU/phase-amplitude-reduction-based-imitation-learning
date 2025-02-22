@@ -34,16 +34,16 @@ If you want to re-try the training, please remove the comment before loading the
 # Citation
 ```
 @article{Yamamori2024Phase,
-    author = {Satoshi Yamamori and Jun Morimoto},
-    title = {Phase-amplitude Reduction-based Imitation Learning},
-    journal = {Advanced Robotics},
-    volume = {0},
-    number = {0},
-    pages = {1--15},
-    year = {2024},
-    publisher = {Taylor \& Francis},
-    doi = {10.1080/01691864.2024.2441242},
-    URL = {https://doi.org/10.1080/01691864.2024.2441242},
-    eprint = {https://doi.org/10.1080/01691864.2024.2441242}
+author = {Satoshi Yamamori and Jun Morimoto},
+title = {Phase-amplitude reduction-based imitation learning},
+journal = {Advanced Robotics},
+volume = {39},
+number = {3},
+pages = {156--170},
+year = {2025},
+publisher = {Taylor \& Francis},
+doi = {10.1080/01691864.2024.2441242},
+URL = {https://doi.org/10.1080/01691864.2024.2441242},
+eprint = {https://doi.org/10.1080/01691864.2024.2441242}
 }
 ```
