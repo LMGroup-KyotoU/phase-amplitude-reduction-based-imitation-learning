@@ -27,6 +27,7 @@ class PADynTrainer:
         amplitude_range: Optional[Sequence]=None,
         recon_loss_coef: Optional[Sequence]=None,
         enable_loss: Optional[Sequence]=None,
+        use_adjoint: bool=False,
     ) -> None:
         self.dim_obs = dim_obs
         self.dim_latent = dim_latent
@@ -53,6 +54,8 @@ class PADynTrainer:
         self.dec = self.dec.to(device)
         self.dyn = self.dyn.to(device)
         self.device = device
+
+        self.use_adjoint = use_adjoint
 
         self.num_iters = num_iters
         self.batch_size = batch_size
@@ -117,6 +120,7 @@ class PADynTrainer:
             amplitude_range=amplitude_range,
             recon_loss_coef=recon_loss_coef,
             enable_loss=enable_loss,
+            use_adjoint=use_adjoint,
         )
 
     def learn(self, trajectory: torch.Tensor):
@@ -149,7 +153,10 @@ class PADynTrainer:
             with torch.no_grad():
                 input_batch = batch
 
-            obs_rec, latent_hist = self.rollout(input_batch, time_length, deterministic=False, predict=True)
+            if self.use_adjoint:
+                obs_rec, latent_hist = self.rollout_adjoint(input_batch, time_length)
+            else:
+                obs_rec, latent_hist = self.rollout(input_batch, time_length, deterministic=False, predict=True)
             # detach computation graph from variation distributions
             # latent_hist = latent_hist.detach()
 
@@ -250,6 +257,43 @@ class PADynTrainer:
 
     def logging(self,):
         return self.record
+
+    def rollout_adjoint(self, obs, episode_length, noise=None):
+        """Predict-mode rollout with discrete-adjoint backward.
+
+        Equivalent in expectation to
+        ``rollout(obs, episode_length, deterministic=False, predict=True)``,
+        but the decoder forward graph is not retained between timesteps:
+        backward re-evaluates the decoder one step at a time and propagates
+        the adjoint through the analytical PA dynamics.
+
+        Parameters
+        ----------
+        obs : torch.Tensor
+            (B, T, D_obs) trajectory batch. Only obs[:, 0:1] is read.
+        episode_length : int
+            Rollout horizon (T).
+        noise : torch.Tensor, optional
+            (B, episode_length, D_lat) latent perturbations. Sampled with
+            ``self.latent_noise`` when omitted; pass an explicit tensor to
+            make the rollout reproducible (e.g. for gradient checks).
+        """
+        if self.num_torus_flow > 0:
+            n_torus = self.num_torus_flow
+            assert self.dim_latent >= n_torus
+        enc_latent = self.enc(obs[:, 0:1])
+        latent_0 = enc_latent[:, 0]
+        batch_size, dim_latent = latent_0.shape
+        if noise is None:
+            noise = torch.randn(
+                batch_size, episode_length, dim_latent,
+                device=latent_0.device, dtype=latent_0.dtype,
+            ) * self.latent_noise
+        obs_rec, latent_hist = AdjointRollout.apply(
+            latent_0, noise, self.delta_t, int(episode_length),
+            self.dec, self.dyn, *self.dec.parameters(),
+        )
+        return obs_rec, latent_hist
 
     def rollout(self, obs, episode_length, deterministic=True, predict=True):
         batch_size = obs.shape[0]
@@ -515,6 +559,120 @@ class PADynamics(nn.Module):
     @property
     def gain(self,):
         return torch.sigmoid(self._logit_gain)
+
+
+class AdjointRollout(torch.autograd.Function):
+    """Discrete adjoint sensitivity for the predict-mode rollout.
+
+    Forward (decoder graph NOT retained):
+        latent_hist[i] = predict(i * dt, latent_0) + noise[i]
+        obs_rec[i]     = dec(latent_hist[i])
+
+    Backward, walking i = 0 .. T - 1:
+        1. Re-evaluate the decoder at latent_hist[i] with a local graph.
+        2. VJP: grad_obs_rec[i] -> dL/d(latent_hist[i]) and dL/d(dec params).
+        3. Add the direct grad_latent_hist[i] contribution from outer losses.
+        4. Adjoint through the analytical PA dynamics
+              dL/d(latent_0)_phase  +=  dL/d(latent_hist[i])_phase
+              dL/d(latent_0)_amp    +=  dL/d(latent_hist[i])_amp
+                                          * exp(time_constants_amp * i * dt)
+
+    Memory peak holds at most one decoder backward graph at a time
+    (versus T graphs for the BPTT rollout). The decoder is forwarded
+    twice (no-grad forward + grad backward), so compute roughly doubles.
+    """
+
+    @staticmethod
+    def forward(ctx, latent_0, noise, dt, T, dec, dyn, *dec_params):
+        ctx.dec = dec
+        ctx.dyn = dyn
+        ctx.dt = float(dt)
+        ctx.T = int(T)
+
+        n_torus = dyn.num_torus_flow
+        time_constants = dyn._time_constants
+        batch_size, dim_latent = latent_0.shape
+        latent_hist = torch.empty(
+            batch_size, ctx.T, dim_latent,
+            device=latent_0.device, dtype=latent_0.dtype,
+        )
+        dim_obs = None
+        obs_rec_chunks = []
+        with torch.no_grad():
+            for i in range(ctx.T):
+                t = ctx.dt * i
+                z = torch.empty_like(latent_0)
+                if n_torus > 0:
+                    z[..., :n_torus] = (
+                        latent_0[..., :n_torus] + time_constants[:n_torus] * t
+                    )
+                if n_torus < dim_latent:
+                    z[..., n_torus:] = (
+                        latent_0[..., n_torus:]
+                        * torch.exp(time_constants[n_torus:] * t)
+                    )
+                if noise is not None:
+                    z = z + noise[:, i]
+                latent_hist[:, i] = z
+                rec = dec(z)
+                if dim_obs is None:
+                    dim_obs = rec.shape[-1]
+                obs_rec_chunks.append(rec)
+        obs_rec = torch.stack(obs_rec_chunks, dim=1)
+
+        ctx.save_for_backward(latent_hist)
+        return obs_rec, latent_hist
+
+    @staticmethod
+    def backward(ctx, grad_obs_rec, grad_latent_hist):
+        latent_hist, = ctx.saved_tensors
+        dec = ctx.dec
+        dyn = ctx.dyn
+        dt = ctx.dt
+        T = ctx.T
+        n_torus = dyn.num_torus_flow
+        time_constants = dyn._time_constants
+
+        dec_params = list(dec.parameters())
+        dec_param_grads = [torch.zeros_like(p) for p in dec_params]
+        batch_size, _, dim_latent = latent_hist.shape
+        grad_latent_0 = torch.zeros(
+            batch_size, dim_latent,
+            device=latent_hist.device, dtype=latent_hist.dtype,
+        )
+
+        for i in range(T):
+            z = latent_hist[:, i].detach().requires_grad_(True)
+            with torch.enable_grad():
+                rec = dec(z)
+                grads = torch.autograd.grad(
+                    rec,
+                    [z] + dec_params,
+                    grad_outputs=grad_obs_rec[:, i],
+                    retain_graph=False,
+                    allow_unused=True,
+                )
+            adj_z = grads[0]
+            for k, g in enumerate(grads[1:]):
+                if g is not None:
+                    dec_param_grads[k] = dec_param_grads[k] + g
+
+            if grad_latent_hist is not None:
+                adj_z = adj_z + grad_latent_hist[:, i]
+
+            t = dt * i
+            adj_propagated = torch.empty_like(adj_z)
+            if n_torus > 0:
+                adj_propagated[..., :n_torus] = adj_z[..., :n_torus]
+            if n_torus < dim_latent:
+                adj_propagated[..., n_torus:] = (
+                    adj_z[..., n_torus:]
+                    * torch.exp(time_constants[n_torus:] * t)
+                )
+            grad_latent_0 = grad_latent_0 + adj_propagated
+
+        # forward args: (latent_0, noise, dt, T, dec, dyn, *dec_params)
+        return (grad_latent_0, None, None, None, None, None) + tuple(dec_param_grads)
 
 
 def wrap_func(x):
